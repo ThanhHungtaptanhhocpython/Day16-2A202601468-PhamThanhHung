@@ -90,22 +90,27 @@ STACK_ORDER = (
     "retry",
 )
 
+BOOSTED_ORDER = ("query_refinement",) + STACK_ORDER
+
 
 def _student_layers(names):
     from harness.layers.budget_policy import BudgetPolicy
     from harness.layers.citation_checker import CitationChecker
     from harness.layers.critic import Critic
     from harness.layers.injection_guard import InjectionGuard
+    from harness.layers.query_refinement import QueryRefinement
     from harness.layers.retry import Retry
 
     classes = {
+        "query_refinement": QueryRefinement,
         "injection_guard": InjectionGuard,
         "critic": Critic,
         "citation_checker": CitationChecker,
         "budget_policy": BudgetPolicy,
         "retry": Retry,
     }
-    return [classes[name]() for name in STACK_ORDER if name in names]
+    order = BOOSTED_ORDER if "query_refinement" in names else STACK_ORDER
+    return [classes[name]() for name in order if name in names]
 
 
 def build_middleware(spec: str):
@@ -113,20 +118,34 @@ def build_middleware(spec: str):
     spec = (spec or "all").strip().lower()
     if spec in ("none", "", "-"):
         return [], []
-    if spec == "all":
+    if spec == "boosted":
+        names = set(BOOSTED_ORDER)
+    elif spec == "all":
         names = set(STACK_ORDER)
     else:
         names = {part.strip() for part in spec.split(",") if part.strip()}
-        unknown = names - set(STACK_ORDER)
+        unknown = names - set(BOOSTED_ORDER)
         if unknown:
             raise SystemExit(
-                f"Không biết lớp: {sorted(unknown)}. Hợp lệ: {list(STACK_ORDER)}"
+                f"Không biết lớp: {sorted(unknown)}. Hợp lệ: {list(BOOSTED_ORDER)}"
             )
-    return _student_layers(names), [name for name in STACK_ORDER if name in names]
+    order = BOOSTED_ORDER if "query_refinement" in names else STACK_ORDER
+    return _student_layers(names), [name for name in order if name in names]
 
 
-def build_model(kind: str, corpus: Corpus, seed: int, timeout: float):
+def build_model(
+    kind: str,
+    corpus: Corpus,
+    seed: int,
+    timeout: float,
+    *,
+    boosted: bool = False,
+):
     if kind == "mock":
+        if boosted:
+            from harness.boosted_mock import BoostedMockModel
+
+            return BoostedMockModel(corpus=corpus, seed=seed)
         return MockModel(corpus=corpus, seed=seed)
     try:
         return RealModel.from_env(timeout=timeout)
@@ -336,6 +355,8 @@ def main(argv=None) -> int:
 
     _probe, layer_names = build_middleware(args.layers)
     del _probe  # a FRESH stack per brief; no state may leak between runs
+    use_boosted_mock = args.model == "mock" and args.layers.strip().lower() == "boosted"
+    model_label = "mock+boosted" if use_boosted_mock else args.model
     config = RunnerConfig(
         flaky=not args.no_flaky,
         prompt_addendum=args.prompt_addendum,
@@ -347,7 +368,7 @@ def main(argv=None) -> int:
         print("=" * 72)
         print(f"AGENT ARENA — VÒNG LUYỆN TẬP (runner {RUNNER_VERSION})")
         print(f"  brief set : {set_name} ({len(briefs)} brief), corpus seed {corpus_seed}")
-        print(f"  model     : {args.model}")
+        print(f"  model     : {model_label}")
         print(f"  lớp       : {', '.join(layer_names) if layer_names else '(không có)'}")
         print("=" * 72)
 
@@ -356,7 +377,13 @@ def main(argv=None) -> int:
     for index, brief in enumerate(briefs):
         seed = derive_seed(args.seed, index)
         layers, _ = build_middleware(args.layers)
-        model = build_model(args.model, corpus, seed, timeout=60.0)
+        model = build_model(
+            args.model,
+            corpus,
+            seed,
+            timeout=60.0,
+            boosted=use_boosted_mock,
+        )
         result = run_brief(
             brief, model=model, corpus=corpus, middleware=layers, seed=seed, config=config
         )
@@ -405,7 +432,7 @@ def main(argv=None) -> int:
         "advisory": set_name == "public",
         "brief_set": set_name,
         "corpus_seed": corpus_seed,
-        "model": args.model,
+        "model": model_label,
         "layers": layer_names,
         "base_seed": args.seed,
         "runner_version": RUNNER_VERSION,
